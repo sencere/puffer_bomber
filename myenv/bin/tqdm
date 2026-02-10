@@ -1,0 +1,6 @@
+#!/media/samurai/a57fa257-23c7-4f26-b256-eae164cd41bb1/projects/puffer_env/puffer_bomber/myenv/bin/python3
+import sys
+from tqdm.cli import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

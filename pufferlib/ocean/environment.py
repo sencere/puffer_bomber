@@ -120,6 +120,7 @@ MAKE_FUNCTIONS = {
     'battle': 'Battle',
     'breakout': 'Breakout',
     'blastar': 'Blastar',
+    'tileblast': 'TileBlast',
     'convert': 'Convert',
     'convert_circle': 'ConvertCircle',
     'pong': 'Pong',

@@ -4,7 +4,7 @@
 
 import contextlib
 import warnings
-warnings.filterwarnings('error', category=RuntimeWarning)
+warnings.filterwarnings('default', category=RuntimeWarning)
 
 import os
 import sys
@@ -31,10 +31,15 @@ import pufferlib
 import pufferlib.sweep
 import pufferlib.vector
 import pufferlib.pytorch
+HAVE_PUFFER_C = True
 try:
     from pufferlib import _C
 except ImportError:
-    raise ImportError('Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation')
+    HAVE_PUFFER_C = False
+    warnings.warn(
+        "PufferLib C/CUDA advantage kernel not found. Falling back to a slower Python implementation.",
+        RuntimeWarning,
+    )
 
 import rich
 import rich.traceback
@@ -52,7 +57,7 @@ from torch.utils.cpp_extension import (
 )
 # Assume advantage kernel has been built if torch has been compiled with CUDA or HIP support
 # and can find CUDA or HIP in the system
-ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME)
+ADVANTAGE_CUDA = bool(CUDA_HOME or ROCM_HOME) and HAVE_PUFFER_C
 
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None):
@@ -664,6 +669,26 @@ def compute_puff_advantage(values, rewards, terminals,
     compile the fast version.'''
 
     device = values.device
+    if not HAVE_PUFFER_C:
+        values = values.float()
+        rewards = rewards.float()
+        terminals = terminals.float()
+        ratio = ratio.float()
+        advantages = advantages.float()
+
+        num_steps, horizon = values.shape
+        for s in range(num_steps):
+            last = 0.0
+            for t in range(horizon - 2, -1, -1):
+                t_next = t + 1
+                next_nonterminal = 1.0 - terminals[s, t_next]
+                rho_t = torch.minimum(ratio[s, t], torch.tensor(vtrace_rho_clip, device=values.device))
+                c_t = torch.minimum(ratio[s, t], torch.tensor(vtrace_c_clip, device=values.device))
+                delta = rho_t * (rewards[s, t_next] + gamma * values[s, t_next] * next_nonterminal - values[s, t])
+                last = delta + gamma * gae_lambda * c_t * last * next_nonterminal
+                advantages[s, t] = last
+        return advantages.to(device)
+
     if not ADVANTAGE_CUDA:
         values = values.cpu()
         rewards = rewards.cpu()
@@ -682,7 +707,7 @@ def compute_puff_advantage(values, rewards, terminals,
 
 def abbreviate(num, b2, c2):
     if num < 1e3:
-        return f'{b2}{num}{c2}'
+        return f'{b2}{num:.1f}{c2}'
     elif num < 1e6:
         return f'{b2}{num/1e3:.1f}{c2}K'
     elif num < 1e9:
