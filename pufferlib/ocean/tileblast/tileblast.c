@@ -4,6 +4,15 @@
 
 #include "tileblast.h"
 
+static int key_action() {
+    if (IsKeyDown(KEY_SPACE)) return ACT_BOMB;
+    if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W)) return ACT_UP;
+    if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S)) return ACT_DOWN;
+    if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) return ACT_LEFT;
+    if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) return ACT_RIGHT;
+    return ACT_NOOP;
+}
+
 int main() {
     TileBlast env = {
         .width = DEFAULT_WIDTH,
@@ -24,6 +33,7 @@ int main() {
     c_render(&env);
 
     while (!WindowShouldClose()) {
+        env.actions[0] = key_action();
         c_step(&env);
         c_render(&env);
     }

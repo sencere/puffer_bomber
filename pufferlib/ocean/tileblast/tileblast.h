@@ -23,6 +23,28 @@
 
 #define SCORE_PER_BRICK 1.0f
 #define SCORE_FOR_GOAL 10.0f
+#define TIMEOUT_PENALTY 0.1f
+#define ENEMY_KILL_REWARD 5.0f
+#define BLAST_DANGER_PENALTY 0.2f
+#define BLAST_ESCAPE_REWARD 0.15f
+#define BOMB_PROX_THRESHOLD 3
+#define BOMB_PROX_PENALTY 0.05f
+#define BOMB_ON_TILE_PENALTY 5.0f
+#define BOMB_ON_TILE_DANGER_TIMER 3
+#define BOMB_PLANT_BASE_REWARD 0.2f
+#define TACTICAL_BOMB_REWARD 1.0f
+#define BOMB_NEAR_ENEMY_RANGE 3
+#define BOMB_NEAR_ENEMY_REWARD 0.4f
+#define MISSED_TACTICAL_BOMB_PENALTY 0.2f
+#define ENEMY_BLOCK_RANGE 3
+#define ENEMY_PATH_BLOCK_PENALTY 0.2f
+#define ENEMY_PATH_AVOID_REWARD 0.1f
+#define STALL_PENALTY 0.005f
+#define NOOP_PENALTY 0.05f
+#define MOVE_REWARD 0.01f
+#define VISIT_HEAT_DECAY 0.95f
+#define VISIT_HEAT_DEPOSIT 1.0f
+#define VISIT_HEAT_PENALTY 0.01f
 
 /* Discrete action ids used by env steps. */
 typedef enum ActionID {
@@ -117,6 +139,8 @@ typedef struct {
     float episode_return_accum;
 
     unsigned char* grid;
+    unsigned char* blast_timer;
+    float* visit_heat;
     Bomb* bombs;
     int max_bombs;
     Enemy enemies[ENEMY_COUNT];
@@ -158,7 +182,11 @@ static float randf() {
 /* Reset all bomb slots to inactive. */
 static void clear_bombs(TileBlast* env) {
     for (int i = 0; i < env->max_bombs; i++) {
-        env->bombs[i].active = 0;
+        Bomb* b = &env->bombs[i];
+        if (b->active) {
+            env->grid[idx(env, b->r, b->c)] = TILE_EMPTY;
+        }
+        b->active = 0;
     }
 }
 
@@ -183,6 +211,154 @@ static int bombs_owned(TileBlast* env, int owner) {
         }
     }
     return count;
+}
+
+static int nearest_bomb_distance(TileBlast* env, int r, int c) {
+    int best = 255;
+    for (int i = 0; i < env->max_bombs; i++) {
+        Bomb* b = &env->bombs[i];
+        if (!b->active) continue;
+        int d = manhattan_distance(r, c, b->r, b->c);
+        if (d < best) best = d;
+    }
+    return best;
+}
+
+static int place_bomb(TileBlast* env) {
+    Agent* a = &env->agents[0];
+    if (!a->alive) return 0;
+    for (int i = 0; i < env->max_bombs; i++) {
+        Bomb* b = &env->bombs[i];
+        if (!b->active) {
+            b->active = 1;
+            b->r = a->r;
+            b->c = a->c;
+            b->owner = 0;
+            b->timer = BOMB_TIMER;
+            b->range = a->range;
+            env->grid[idx(env, b->r, b->c)] = TILE_BOMB;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int bomb_has_tactical_target(TileBlast* env, int r, int c, int range) {
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        Enemy* e = &env->enemies[i];
+        if (!e->alive) continue;
+
+        if (e->r == r) {
+            int dc = e->c - c;
+            int dist = dc < 0 ? -dc : dc;
+            if (dist > range) continue;
+            int step = (dc < 0) ? -1 : 1;
+            int clear = 1;
+            for (int cc = c + step; cc != e->c; cc += step) {
+                unsigned char tile = env->grid[idx(env, r, cc)];
+                if (tile == TILE_HARD || tile == TILE_SOFT) {
+                    clear = 0;
+                    break;
+                }
+            }
+            if (clear) return 1;
+        } else if (e->c == c) {
+            int dr = e->r - r;
+            int dist = dr < 0 ? -dr : dr;
+            if (dist > range) continue;
+            int step = (dr < 0) ? -1 : 1;
+            int clear = 1;
+            for (int rr = r + step; rr != e->r; rr += step) {
+                unsigned char tile = env->grid[idx(env, rr, c)];
+                if (tile == TILE_HARD || tile == TILE_SOFT) {
+                    clear = 0;
+                    break;
+                }
+            }
+            if (clear) return 1;
+        }
+    }
+    return 0;
+}
+
+static void mark_blast(TileBlast* env, int r, int c) {
+    if (!in_bounds(env, r, c)) return;
+    int i = idx(env, r, c);
+    env->blast_timer[i] = BLAST_TIME;
+}
+
+static void damage_tile(TileBlast* env, int r, int c, int* agent_hit, int* enemies_killed) {
+    Agent* a = &env->agents[0];
+    if (*agent_hit == 0 && a->alive && a->r == r && a->c == c) {
+        *agent_hit = 1;
+        a->alive = 0;
+    }
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        Enemy* e = &env->enemies[i];
+        if (e->alive && e->r == r && e->c == c) {
+            e->alive = 0;
+            (*enemies_killed) += 1;
+            env->score_points += ENEMY_KILL_REWARD;
+        }
+    }
+}
+
+static void explode_bomb(TileBlast* env, Bomb* bomb, int* agent_hit, int* enemies_killed) {
+    if (!bomb->active) return;
+    bomb->active = 0;
+    int center_idx = idx(env, bomb->r, bomb->c);
+    if (env->grid[center_idx] == TILE_BOMB) {
+        env->grid[center_idx] = TILE_EMPTY;
+    }
+    mark_blast(env, bomb->r, bomb->c);
+    damage_tile(env, bomb->r, bomb->c, agent_hit, enemies_killed);
+
+    static const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (int d = 0; d < 4; d++) {
+        int dr = dirs[d][0];
+        int dc = dirs[d][1];
+        for (int k = 1; k <= bomb->range; k++) {
+            int rr = bomb->r + dr * k;
+            int cc = bomb->c + dc * k;
+            if (!in_bounds(env, rr, cc)) break;
+            unsigned char tile = env->grid[idx(env, rr, cc)];
+            if (tile == TILE_HARD) break;
+            mark_blast(env, rr, cc);
+            damage_tile(env, rr, cc, agent_hit, enemies_killed);
+            if (tile == TILE_SOFT) {
+                env->grid[idx(env, rr, cc)] = TILE_EMPTY;
+                break;
+            }
+        }
+    }
+}
+
+static void update_bombs(TileBlast* env, int* agent_hit, int* enemies_killed) {
+    for (int i = 0; i < env->max_bombs; i++) {
+        Bomb* b = &env->bombs[i];
+        if (!b->active) continue;
+        b->timer -= 1;
+        if (b->timer <= 0) {
+            explode_bomb(env, b, agent_hit, enemies_killed);
+        }
+    }
+}
+
+static void decay_blasts(TileBlast* env) {
+    int cells = env->width * env->height;
+    for (int i = 0; i < cells; i++) {
+        if (env->blast_timer[i] > 0) {
+            env->blast_timer[i] -= 1;
+        }
+    }
+}
+
+static void decay_visit_heat(TileBlast* env) {
+    int cells = env->width * env->height;
+    for (int i = 0; i < cells; i++) {
+        env->visit_heat[i] *= VISIT_HEAT_DECAY;
+        if (env->visit_heat[i] < 0.0001f) env->visit_heat[i] = 0.0f;
+    }
 }
 
 /* --- Threat analysis ----------------------------------------------------- */
@@ -261,10 +437,54 @@ static int is_solid(TileBlast* env, int r, int c, int agent_idx) {
 
 /* Leaves spawn/goal-adjacent cells open during random map generation. */
 static int is_spawn_clear(TileBlast* env, int r, int c) {
-    int sr = 1, sc = 1;
-    int gr = env->height - 2, gc = env->width - 2;
-    if ((r == sr && c == sc) || (r == sr + 1 && c == sc) || (r == sr && c == sc + 1)) return 1;
-    if ((r == gr && c == gc) || (r == gr - 1 && c == gc) || (r == gr && c == gc - 1)) return 1;
+    int sr = env->agents[0].r;
+    int sc = env->agents[0].c;
+    int gr = env->goal_r, gc = env->goal_c;
+    if (manhattan_distance(r, c, sr, sc) <= 1) return 1;
+    if (manhattan_distance(r, c, gr, gc) <= 1) return 1;
+    return 0;
+}
+
+static void sample_goal_tile(TileBlast* env) {
+    for (int attempt = 0; attempt < 256; attempt++) {
+        int r = 1 + (rand() % (env->height - 2));
+        int c = 1 + (rand() % (env->width - 2));
+        if ((r <= 2) && (c <= 2)) continue;
+        if ((r % 2 == 0) && (c % 2 == 0)) continue;
+        env->goal_r = r;
+        env->goal_c = c;
+        return;
+    }
+    env->goal_r = env->height - 2;
+    env->goal_c = env->width - 2;
+}
+
+static void sample_agent_tile(TileBlast* env, int* out_r, int* out_c) {
+    for (int attempt = 0; attempt < 256; attempt++) {
+        int r = 1 + (rand() % (env->height - 2));
+        int c = 1 + (rand() % (env->width - 2));
+        if ((r % 2 == 0) && (c % 2 == 0)) continue;
+        if (manhattan_distance(r, c, env->goal_r, env->goal_c) <= 2) continue;
+        *out_r = r;
+        *out_c = c;
+        return;
+    }
+    *out_r = 1;
+    *out_c = 1;
+}
+
+static int reserve_enemy_tile(TileBlast* env, int* out_r, int* out_c) {
+    for (int attempt = 0; attempt < 256; attempt++) {
+        int r = 1 + (rand() % (env->height - 2));
+        int c = 1 + (rand() % (env->width - 2));
+        if (r == env->agents[0].r && c == env->agents[0].c) continue;
+        if (r == env->goal_r && c == env->goal_c) continue;
+        if (env->grid[idx(env, r, c)] == TILE_HARD) continue;
+        if (enemy_at(env, r, c, -1)) continue;
+        *out_r = r;
+        *out_c = c;
+        return 1;
+    }
     return 0;
 }
 
@@ -277,6 +497,44 @@ static int enemy_at(TileBlast* env, int r, int c, int skip_idx) {
             return 1;
         }
     }
+    return 0;
+}
+
+static int action_toward_goal(int r, int c, int goal_r, int goal_c) {
+    int dr = goal_r - r;
+    int dc = goal_c - c;
+    if (dr == 0 && dc == 0) return ACT_NOOP;
+    if (abs(dr) >= abs(dc)) {
+        return (dr > 0) ? ACT_DOWN : ACT_UP;
+    }
+    return (dc > 0) ? ACT_RIGHT : ACT_LEFT;
+}
+
+static int enemy_blocks_action(TileBlast* env, int r, int c, int action, int max_dist) {
+    int step_r = 0;
+    int step_c = 0;
+    if (action == ACT_UP) step_r = -1;
+    else if (action == ACT_DOWN) step_r = 1;
+    else if (action == ACT_LEFT) step_c = -1;
+    else if (action == ACT_RIGHT) step_c = 1;
+    else return 0;
+
+    for (int k = 1; k <= max_dist; k++) {
+        int rr = r + step_r * k;
+        int cc = c + step_c * k;
+        if (!in_bounds(env, rr, cc)) break;
+        unsigned char tile = env->grid[idx(env, rr, cc)];
+        if (tile == TILE_HARD || tile == TILE_SOFT || tile == TILE_BOMB) break;
+        if (enemy_at(env, rr, cc, -1)) return 1;
+    }
+    return 0;
+}
+
+static int has_legal_move(TileBlast* env, int r, int c) {
+    if (!is_solid(env, r - 1, c, 0)) return 1;
+    if (!is_solid(env, r + 1, c, 0)) return 1;
+    if (!is_solid(env, r, c - 1, 0)) return 1;
+    if (!is_solid(env, r, c + 1, 0)) return 1;
     return 0;
 }
 
@@ -387,6 +645,9 @@ static void update_observations(TileBlast* env) {
             for (int rr = 0; rr < env->height; rr++) {
                 for (int cc = 0; cc < env->width; cc++) {
                     unsigned char v = env->grid[idx(env, rr, cc)];
+                    if (env->blast_timer[idx(env, rr, cc)] > 0) {
+                        v = TILE_BLAST;
+                    }
                     if (self->alive && self->r == rr && self->c == cc) {
                         v = TILE_AGENT0;
                     } else if (enemy_at(env, rr, cc, -1)) {
@@ -406,6 +667,9 @@ static void update_observations(TileBlast* env) {
                         grid_obs[idx_local] = TILE_HARD;
                     } else {
                         unsigned char v = env->grid[idx(env, rr, cc)];
+                        if (env->blast_timer[idx(env, rr, cc)] > 0) {
+                            v = TILE_BLAST;
+                        }
                         if (self->alive && self->r == rr && self->c == cc) {
                             v = TILE_AGENT0;
                         } else if (enemy_at(env, rr, cc, -1)) {
@@ -483,6 +747,8 @@ static void init(TileBlast* env) {
 
     int cells = env->width * env->height;
     env->grid = (unsigned char*)calloc(cells, sizeof(unsigned char));
+    env->blast_timer = (unsigned char*)calloc(cells, sizeof(unsigned char));
+    env->visit_heat = (float*)calloc(cells, sizeof(float));
     env->max_bombs = env->num_agents * MAX_BOMBS_PER_AGENT + 4;
     env->bombs = (Bomb*)calloc(env->max_bombs, sizeof(Bomb));
     env->episode_return_accum = 0.0f;
@@ -496,34 +762,39 @@ static void c_reset(TileBlast* env) {
     env->episode_return_accum = 0.0f;
     env->score_points = 0.0f;
 
-    clear_bombs(env);
-    generate_map(env);
-
-    env->goal_r = env->height - 2;
-    env->goal_c = env->width - 2;
-    env->grid[idx(env, env->goal_r, env->goal_c)] = TILE_EMPTY;
-
+    memset(env->blast_timer, 0, env->width * env->height);
+    memset(env->visit_heat, 0, env->width * env->height * sizeof(float));
+    sample_goal_tile(env);
+    int spawn_r = 1;
+    int spawn_c = 1;
+    sample_agent_tile(env, &spawn_r, &spawn_c);
     env->agents[0] = (Agent){
-        .r = 1,
-        .c = 1,
+        .r = spawn_r,
+        .c = spawn_c,
         .alive = 1,
         .bombs_max = MAX_BOMBS_PER_AGENT,
         .range = DEFAULT_RANGE,
         .lives = START_LIVES,
         .invuln = RESPAWN_INVULN,
     };
-    init_enemy_patrol(env, 0, 1, env->width - 2, 1, -1);
-    init_enemy_patrol(env, 1, env->height - 2, 1, 1, 1);
-    {
-        int mid_r = env->height / 2;
-        int mid_c = env->width / 2;
-        if ((mid_r % 2) == 0) mid_r += 1;
-        if ((mid_c % 2) == 0) mid_c += 1;
-        if (mid_r >= env->height - 1) mid_r = env->height - 2;
-        if (mid_c >= env->width - 1) mid_c = env->width - 2;
-        if ((mid_r % 2) == 0 && mid_r > 1) mid_r -= 1;
-        if ((mid_c % 2) == 0 && mid_c > 1) mid_c -= 1;
-        init_enemy_patrol(env, 2, mid_r, mid_c, 1, 1);
+    clear_bombs(env);
+    generate_map(env);
+    env->grid[idx(env, env->goal_r, env->goal_c)] = TILE_EMPTY;
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        env->enemies[i].alive = 0;
+    }
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        int er = 1;
+        int ec = 1;
+        if (!reserve_enemy_tile(env, &er, &ec)) {
+            er = 1 + i;
+            ec = env->width - 2 - i;
+            if (er >= env->height - 1) er = env->height - 2;
+            if (ec <= 0) ec = 1;
+        }
+        int horizontal = rand() & 1;
+        int dir = (rand() & 1) ? 1 : -1;
+        init_enemy_patrol(env, i, er, ec, horizontal, dir);
     }
 
     update_observations(env);
@@ -552,35 +823,117 @@ static void resolve_move(TileBlast* env, int action) {
 }
 
 /* --- Runtime step ------------------------------------------------------ */
-/* Minimal random-policy transition function. */
+/* Simple reward shaping that favors progress toward the goal. */
 static void c_step(TileBlast* env) {
     env->tick += 1;
     env->terminals[0] = 0;
+    decay_blasts(env);
+    decay_visit_heat(env);
 
     Agent* a = &env->agents[0];
-    int action = 1 + (rand() % 4); // random move: up/down/left/right
+    int prev_threat = min_bomb_timer_affecting(env, a->r, a->c);
+    int prev_r = a->r;
+    int prev_c = a->c;
+    int goal_action = action_toward_goal(prev_r, prev_c, env->goal_r, env->goal_c);
+    int goal_lane_blocked = enemy_blocks_action(env, prev_r, prev_c, goal_action, ENEMY_BLOCK_RANGE);
+    int tactical_bomb_available = bomb_has_tactical_target(env, prev_r, prev_c, a->range);
+    int can_place_bomb = (bombs_owned(env, 0) < a->bombs_max && !bomb_at(env, prev_r, prev_c));
+
+    int action = ACT_NOOP;
+    if (env->actions) action = env->actions[0];
+    if (action < ACT_NOOP || action > ACT_BOMB) action = ACT_NOOP;
     resolve_move(env, action);
     move_enemies(env);
+    int planted_bomb = 0;
+    if (action == ACT_BOMB) {
+        planted_bomb = place_bomb(env);
+    }
 
+    int agent_hit = 0;
+    int enemies_killed = 0;
+    update_bombs(env, &agent_hit, &enemies_killed);
+
+    float reward = 0.0f;
+    if (a->alive) {
+        int legal_moves = has_legal_move(env, prev_r, prev_c);
+        int moved = (a->r != prev_r || a->c != prev_c);
+        if (moved) {
+            reward += MOVE_REWARD;
+        } else {
+            if (legal_moves) reward -= STALL_PENALTY;
+        }
+        if (action == ACT_NOOP && legal_moves) {
+            reward -= NOOP_PENALTY;
+        }
+        if (planted_bomb) {
+            reward += BOMB_PLANT_BASE_REWARD;
+            if (tactical_bomb_available) {
+                reward += TACTICAL_BOMB_REWARD;
+            }
+            int dist_enemy_prev = nearest_enemy_distance(env, prev_r, prev_c);
+            if (dist_enemy_prev <= BOMB_NEAR_ENEMY_RANGE) {
+                reward += BOMB_NEAR_ENEMY_REWARD;
+            }
+        } else if (action != ACT_BOMB && tactical_bomb_available && can_place_bomb) {
+            reward -= MISSED_TACTICAL_BOMB_PENALTY;
+        }
+        int new_threat = min_bomb_timer_affecting(env, a->r, a->c);
+        int dist_bomb = nearest_bomb_distance(env, a->r, a->c);
+        if (dist_bomb <= BOMB_PROX_THRESHOLD) {
+            reward -= (float)(BOMB_PROX_THRESHOLD + 1 - dist_bomb) * BOMB_PROX_PENALTY;
+            if (dist_bomb == 0 && new_threat <= BOMB_ON_TILE_DANGER_TIMER) {
+                reward -= BOMB_ON_TILE_PENALTY;
+            }
+        }
+        if (new_threat <= 3) {
+            reward -= BLAST_DANGER_PENALTY;
+        }
+        if (prev_threat <= 3 && (new_threat > prev_threat || new_threat == 255)) {
+            reward += BLAST_ESCAPE_REWARD;
+        }
+        if (goal_lane_blocked) {
+            if (action == goal_action) {
+                reward -= ENEMY_PATH_BLOCK_PENALTY;
+            } else if (action >= ACT_UP && action <= ACT_RIGHT &&
+                       (a->r != prev_r || a->c != prev_c)) {
+                reward += ENEMY_PATH_AVOID_REWARD;
+            }
+        }
+        int self_idx = idx(env, a->r, a->c);
+        reward -= env->visit_heat[self_idx] * VISIT_HEAT_PENALTY;
+        env->visit_heat[self_idx] += VISIT_HEAT_DEPOSIT;
+    }
+    if (enemies_killed > 0) {
+        reward += (float)enemies_killed * ENEMY_KILL_REWARD;
+    }
     int done = 0;
     if (a->alive && a->r == env->goal_r && a->c == env->goal_c) {
         env->score_points += SCORE_FOR_GOAL;
+        reward += SCORE_FOR_GOAL;
         done = 1;
     }
 
     if (!done && a->alive && enemy_at(env, a->r, a->c, -1)) {
         a->alive = 0;
         env->log.deaths += 1.0f;
+        reward -= SCORE_FOR_GOAL * 0.5f;
+        done = 1;
+    }
+
+    if (!done && agent_hit) {
+        env->log.deaths += 1.0f;
+        reward -= SCORE_FOR_GOAL * 0.5f;
         done = 1;
     }
 
     if (!done && env->tick >= env->max_steps) {
         done = 1;
         env->log.timeouts += 1.0f;
+        reward -= TIMEOUT_PENALTY;
     }
 
-    env->rewards[0] = 2.0f * randf() - 1.0f;
-    env->episode_return_accum += env->rewards[0];
+    env->rewards[0] = reward;
+    env->episode_return_accum += reward;
 
     if (done) {
         env->terminals[0] = 1;
@@ -647,6 +1000,16 @@ static void c_render(TileBlast* env) {
             if (t == TILE_SOFT) {
                 DrawRectangle(x + 3, y + 3, tile - 6, tile - 6, (Color){138, 125, 255, 235});
             }
+            if (env->blast_timer[idx(env, r, c)] > 0) {
+                int tval = env->blast_timer[idx(env, r, c)];
+                int inset = 3 + (BLAST_TIME - tval);
+                if (inset > tile / 2 - 1) inset = tile / 2 - 1;
+                int glow = 120 + tval * 45;
+                if (glow > 255) glow = 255;
+                DrawRectangle(x + inset, y + inset, tile - 2 * inset, tile - 2 * inset, (Color){255, 190, 70, glow});
+                DrawRectangle(x + tile / 2 - 2, y + 4, 4, tile - 8, (Color){255, 240, 170, glow});
+                DrawRectangle(x + 4, y + tile / 2 - 2, tile - 8, 4, (Color){255, 240, 170, glow});
+            }
         }
     }
 
@@ -696,6 +1059,8 @@ static void c_close(TileBlast* env) {
         UnloadRenderTexture(g_static_tex);
         g_static_ready = 0;
     }
+    free(env->visit_heat);
+    free(env->blast_timer);
     free(env->grid);
     free(env->bombs);
 }
