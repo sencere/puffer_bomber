@@ -17,19 +17,18 @@ def main():
 
     # Disable rendering during training
     args["env"]["render_mode"] = None
-    args["train"]["device"] = "cpu"
-    args["env"]["num_agents"] = 2
+    args["env"]["num_agents"] = 1
     args["env"]["num_envs"] = 1
     args["env"]["vision"] = 0
     args["env"]["max_steps"] = 500
-    args["train"]["total_timesteps"] = 300000
-    args["train"]["device"] = "cpu"
+    args["train"]["total_timesteps"] = 3000000
+    args["train"]["device"] = "cuda"
     # Exploration + stable PPO updates for sparse terminal rewards
     args["train"]["learning_rate"] = 3e-4
     args["train"]["anneal_lr"] = False
     args["train"]["ent_coef"] = 0.03
     args["train"]["minibatch_size"] = 512
-    
+
     pufferl.train(env_name, args=args)
 
 

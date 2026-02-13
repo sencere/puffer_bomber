@@ -1,4 +1,4 @@
-'''TileBlast: 2-agent bomberman-style environment.'''
+'''TileBlast: single-agent bomber-style environment with goal objective.'''
 
 import gymnasium
 import numpy as np
@@ -6,7 +6,7 @@ import numpy as np
 import pufferlib
 from pufferlib.ocean.tileblast import binding
 
-SCALAR_OBS = 5
+SCALAR_OBS = 8
 
 class TileBlast(pufferlib.PufferEnv):
     def __init__(
@@ -16,13 +16,14 @@ class TileBlast(pufferlib.PufferEnv):
         log_interval=128,
         buf=None,
         seed=0,
-        num_agents=2,
+        num_agents=1,
         width=15,
         height=13,
+        agent_speed=1,
         max_steps=200000,
         vision=0,
     ):
-        assert num_agents in {1, 2}, "num_agents must be 1 or 2"
+        assert num_agents == 1, "TileBlast goal mode is single-agent (num_agents must be 1)"
         if vision == 0:
             grid_size = width * height
         else:
@@ -51,6 +52,7 @@ class TileBlast(pufferlib.PufferEnv):
                 num_agents=num_agents,
                 width=width,
                 height=height,
+                agent_speed=agent_speed,
                 max_steps=max_steps,
                 vision=vision,
             )
@@ -91,12 +93,12 @@ class TileBlast(pufferlib.PufferEnv):
 
 if __name__ == '__main__':
     N = 8
-    env = TileBlast(num_envs=N, num_agents=2)
+    env = TileBlast(num_envs=N, num_agents=1)
     env.reset()
     steps = 0
 
     CACHE = 1024
-    actions = np.random.randint(0, 6, (CACHE, N * 2))
+    actions = np.random.randint(0, 6, (CACHE, N))
 
     i = 0
     import time
