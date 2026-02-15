@@ -22,29 +22,34 @@
 #define RESPAWN_INVULN 0
 
 #define SCORE_PER_BRICK 1.0f
-#define SCORE_FOR_GOAL 10.0f
-#define TIMEOUT_PENALTY 0.1f
-#define ENEMY_KILL_REWARD 5.0f
+#define SCORE_FOR_GOAL 15.0f
+#define TIMEOUT_PENALTY 1.0f
+#define ENEMY_KILL_REWARD 1.0f
 #define BLAST_DANGER_PENALTY 0.2f
 #define BLAST_ESCAPE_REWARD 0.15f
 #define BOMB_PROX_THRESHOLD 3
 #define BOMB_PROX_PENALTY 0.05f
 #define BOMB_ON_TILE_PENALTY 5.0f
 #define BOMB_ON_TILE_DANGER_TIMER 3
-#define BOMB_PLANT_BASE_REWARD 0.2f
-#define TACTICAL_BOMB_REWARD 1.0f
+#define BOMB_PLANT_BASE_REWARD 0.05f
+#define TACTICAL_BOMB_REWARD 0.25f
 #define BOMB_NEAR_ENEMY_RANGE 3
-#define BOMB_NEAR_ENEMY_REWARD 0.4f
-#define MISSED_TACTICAL_BOMB_PENALTY 0.2f
+#define BOMB_NEAR_ENEMY_REWARD 0.10f
+#define MISSED_TACTICAL_BOMB_PENALTY 0.05f
 #define ENEMY_BLOCK_RANGE 3
-#define ENEMY_PATH_BLOCK_PENALTY 0.2f
-#define ENEMY_PATH_AVOID_REWARD 0.1f
-#define STALL_PENALTY 0.005f
+#define ENEMY_PATH_BLOCK_PENALTY 0.08f
+#define ENEMY_PATH_AVOID_REWARD 0.03f
+#define STALL_PENALTY 0.02f
 #define NOOP_PENALTY 0.05f
-#define MOVE_REWARD 0.01f
+#define MOVE_REWARD 0.0f
+#define STEP_PENALTY 0.01f
+#define GOAL_PROGRESS_REWARD 0.35f
 #define VISIT_HEAT_DECAY 0.95f
 #define VISIT_HEAT_DEPOSIT 1.0f
-#define VISIT_HEAT_PENALTY 0.01f
+#define VISIT_HEAT_PENALTY 0.002f
+#define STUCK_NO_PROGRESS_STEPS 6
+#define STUCK_HEAT_THRESHOLD 2.5f
+#define DETOUR_MAX_MANHATTAN_INCREASE 3
 
 /* Discrete action ids used by env steps. */
 typedef enum ActionID {
@@ -146,6 +151,8 @@ typedef struct {
     Enemy enemies[ENEMY_COUNT];
     Agent agents[1];
     float score_points;
+    int last_goal_dist;
+    int no_progress_steps;
 } TileBlast;
 /* --- Grid helpers -------------------------------------------------------- */
 /* Convert (row, col) to a row-major flat index. */
@@ -172,6 +179,7 @@ static RenderTexture2D g_static_tex = {0};
 static int g_static_ready = 0;
 static int g_static_w = 0;
 static int g_static_h = 0;
+static int g_show_visit_heat = 1;
 
 /* --- Random helpers ------------------------------------------------------ */
 static float randf() {
@@ -546,6 +554,261 @@ static int enemy_walkable(TileBlast* env, int r, int c) {
     return 1;
 }
 
+/* --- Safe pathfinding -------------------------------------------------- */
+static int adjacent_enemy(TileBlast* env, int r, int c) {
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        Enemy* e = &env->enemies[i];
+        if (!e->alive) continue;
+        if (manhattan_distance(r, c, e->r, e->c) <= 1) return 1;
+    }
+    return 0;
+}
+
+static int move_target(TileBlast* env, int r, int c, int action, int* out_r, int* out_c) {
+    int nr = r;
+    int nc = c;
+    if (action == ACT_UP) nr -= 1;
+    else if (action == ACT_DOWN) nr += 1;
+    else if (action == ACT_LEFT) nc -= 1;
+    else if (action == ACT_RIGHT) nc += 1;
+    else return 0;
+    if (!in_bounds(env, nr, nc)) return 0;
+    *out_r = nr;
+    *out_c = nc;
+    return 1;
+}
+
+static int safe_walkable(TileBlast* env, int r, int c) {
+    if (!in_bounds(env, r, c)) return 0;
+    if (is_solid(env, r, c, 0)) return 0;
+    if (enemy_at(env, r, c, -1)) return 0;
+    if (adjacent_enemy(env, r, c)) return 0;
+    if (env->blast_timer[idx(env, r, c)] > 0) return 0;
+    if (min_bomb_timer_affecting(env, r, c) <= 2) return 0;
+    return 1;
+}
+
+static int action_is_unsafe(TileBlast* env, int r, int c, int action) {
+    if (action == ACT_NOOP) return 1;
+    if (action == ACT_BOMB) return 0;
+    int nr = r;
+    int nc = c;
+    if (!move_target(env, r, c, action, &nr, &nc)) return 1;
+    return !safe_walkable(env, nr, nc);
+}
+
+static int safe_fallback_action(TileBlast* env, int r, int c) {
+    int best_action = ACT_NOOP;
+    int best_score = -1000000;
+    static const int actions[4] = {ACT_UP, ACT_DOWN, ACT_LEFT, ACT_RIGHT};
+    for (int i = 0; i < 4; i++) {
+        int a = actions[i];
+        int nr = r;
+        int nc = c;
+        if (!move_target(env, r, c, a, &nr, &nc)) continue;
+        if (!safe_walkable(env, nr, nc)) continue;
+
+        int score = 0;
+        score -= manhattan_distance(nr, nc, env->goal_r, env->goal_c) * 10;
+        score += nearest_enemy_distance(env, nr, nc);
+        score += min_bomb_timer_affecting(env, nr, nc);
+        if (score > best_score) {
+            best_score = score;
+            best_action = a;
+        }
+    }
+    return best_action;
+}
+
+static int choose_detour_action(TileBlast* env, int r, int c) {
+    int cur_dist = manhattan_distance(r, c, env->goal_r, env->goal_c);
+    int best_action = ACT_NOOP;
+    float best_score = -1e9f;
+    static const int actions[4] = {ACT_UP, ACT_DOWN, ACT_LEFT, ACT_RIGHT};
+
+    for (int i = 0; i < 4; i++) {
+        int a = actions[i];
+        int nr = r;
+        int nc = c;
+        if (!move_target(env, r, c, a, &nr, &nc)) continue;
+        if (!safe_walkable(env, nr, nc)) continue;
+
+        int nd = manhattan_distance(nr, nc, env->goal_r, env->goal_c);
+        if (nd > cur_dist + DETOUR_MAX_MANHATTAN_INCREASE) continue;
+
+        float heat = env->visit_heat[idx(env, nr, nc)];
+        int enemy_dist = nearest_enemy_distance(env, nr, nc);
+        int bomb_timer = min_bomb_timer_affecting(env, nr, nc);
+
+        // Prefer lower-pheromone detours while still keeping goal pressure.
+        float score = 0.0f;
+        score -= (float)nd * 4.0f;
+        score -= heat * 25.0f;
+        score += (float)enemy_dist * 0.6f;
+        score += (float)bomb_timer * 0.2f;
+
+        if (score > best_score) {
+            best_score = score;
+            best_action = a;
+        }
+    }
+
+    if (best_action != ACT_NOOP) return best_action;
+    return safe_fallback_action(env, r, c);
+}
+
+static int find_safe_goal_action(TileBlast* env, int start_r, int start_c) {
+    if (start_r == env->goal_r && start_c == env->goal_c) return ACT_NOOP;
+
+    int cells = env->width * env->height;
+    int* queue = (int*)malloc(sizeof(int) * cells);
+    int* parent = (int*)malloc(sizeof(int) * cells);
+    int* first_action = (int*)malloc(sizeof(int) * cells);
+    unsigned char* visited = (unsigned char*)calloc(cells, sizeof(unsigned char));
+    if (!queue || !parent || !first_action || !visited) {
+        free(queue); free(parent); free(first_action); free(visited);
+        return safe_fallback_action(env, start_r, start_c);
+    }
+
+    for (int i = 0; i < cells; i++) {
+        parent[i] = -1;
+        first_action[i] = ACT_NOOP;
+    }
+
+    int start = idx(env, start_r, start_c);
+    int goal = idx(env, env->goal_r, env->goal_c);
+    int qh = 0, qt = 0;
+    queue[qt++] = start;
+    visited[start] = 1;
+
+    static const int actions[4] = {ACT_UP, ACT_DOWN, ACT_LEFT, ACT_RIGHT};
+    int found = 0;
+    while (qh < qt) {
+        int cur = queue[qh++];
+        if (cur == goal) {
+            found = 1;
+            break;
+        }
+
+        int cr = cur / env->width;
+        int cc = cur % env->width;
+        for (int i = 0; i < 4; i++) {
+            int a = actions[i];
+            int nr = cr;
+            int nc = cc;
+            if (!move_target(env, cr, cc, a, &nr, &nc)) continue;
+            int ni = idx(env, nr, nc);
+            if (visited[ni]) continue;
+            if (ni != goal && !safe_walkable(env, nr, nc)) continue;
+            if (ni == goal && enemy_at(env, nr, nc, -1)) continue;
+
+            visited[ni] = 1;
+            parent[ni] = cur;
+            first_action[ni] = (cur == start) ? a : first_action[cur];
+            queue[qt++] = ni;
+        }
+    }
+
+    int action = ACT_NOOP;
+    if (found) {
+        action = first_action[goal];
+    } else {
+        action = safe_fallback_action(env, start_r, start_c);
+    }
+
+    free(queue);
+    free(parent);
+    free(first_action);
+    free(visited);
+    return action;
+}
+
+static int in_closed_interval(int x, int a, int b) {
+    if (a <= b) return x >= a && x <= b;
+    return x >= b && x <= a;
+}
+
+static int enemy_on_manhattan_path(TileBlast* env, int r, int c, int goal_r, int goal_c) {
+    // Enemy lies on at least one shortest (Manhattan) corridor toward the goal.
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        Enemy* e = &env->enemies[i];
+        if (!e->alive) continue;
+        if (e->r == r && in_closed_interval(e->c, c, goal_c)) return 1;
+        if (e->c == c && in_closed_interval(e->r, r, goal_r)) return 1;
+    }
+    return 0;
+}
+
+static int should_bomb_manhattan_blocker(TileBlast* env, int r, int c, int goal_r, int goal_c, int range) {
+    if (!enemy_on_manhattan_path(env, r, c, goal_r, goal_c)) return 0;
+    if (!bomb_has_tactical_target(env, r, c, range)) return 0;
+    // Avoid planting if we're already in immediate bomb danger.
+    if (min_bomb_timer_affecting(env, r, c) <= BOMB_ON_TILE_DANGER_TIMER) return 0;
+    return 1;
+}
+
+static int find_manhattan_blocking_enemy(TileBlast* env, int r, int c, int goal_r, int goal_c, int* out_r, int* out_c) {
+    int best = 1000000;
+    int found = 0;
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        Enemy* e = &env->enemies[i];
+        if (!e->alive) continue;
+
+        int on_path = 0;
+        if (e->r == r && in_closed_interval(e->c, c, goal_c)) on_path = 1;
+        if (e->c == c && in_closed_interval(e->r, r, goal_r)) on_path = 1;
+        if (!on_path) continue;
+
+        int d = manhattan_distance(r, c, e->r, e->c);
+        if (d < best) {
+            best = d;
+            *out_r = e->r;
+            *out_c = e->c;
+            found = 1;
+        }
+    }
+    return found;
+}
+
+static int choose_destroy_blocker_action(TileBlast* env, int r, int c, int enemy_r, int enemy_c) {
+    int best_action = ACT_NOOP;
+    float best_score = -1e9f;
+    static const int actions[4] = {ACT_UP, ACT_DOWN, ACT_LEFT, ACT_RIGHT};
+
+    for (int i = 0; i < 4; i++) {
+        int a = actions[i];
+        int nr = r;
+        int nc = c;
+        if (!move_target(env, r, c, a, &nr, &nc)) continue;
+        if (!safe_walkable(env, nr, nc)) continue;
+
+        int de = manhattan_distance(nr, nc, enemy_r, enemy_c);
+        int dg = manhattan_distance(nr, nc, env->goal_r, env->goal_c);
+        float heat = env->visit_heat[idx(env, nr, nc)];
+        int bomb_timer = min_bomb_timer_affecting(env, nr, nc);
+        int enemy_dist = nearest_enemy_distance(env, nr, nc);
+
+        // Strongly prefer moves that line up and get into bomb range of blocker.
+        float score = 0.0f;
+        score -= (float)de * 10.0f;
+        score -= (float)dg * 2.0f;
+        score -= heat * 20.0f;
+        score += (float)bomb_timer * 0.2f;
+        score += (float)enemy_dist * 0.3f;
+
+        if (nr == enemy_r || nc == enemy_c) score += 4.0f;
+        if (de <= DEFAULT_RANGE) score += 6.0f;
+
+        if (score > best_score) {
+            best_score = score;
+            best_action = a;
+        }
+    }
+
+    if (best_action != ACT_NOOP) return best_action;
+    return safe_fallback_action(env, r, c);
+}
+
 /* Initializes one enemy and clears its patrol line through soft tiles. */
 static void init_enemy_patrol(TileBlast* env, int enemy_idx, int r, int c, int horizontal, int dir) {
     Enemy* e = &env->enemies[enemy_idx];
@@ -777,6 +1040,8 @@ static void c_reset(TileBlast* env) {
         .lives = START_LIVES,
         .invuln = RESPAWN_INVULN,
     };
+    env->last_goal_dist = manhattan_distance(spawn_r, spawn_c, env->goal_r, env->goal_c);
+    env->no_progress_steps = 0;
     clear_bombs(env);
     generate_map(env);
     env->grid[idx(env, env->goal_r, env->goal_c)] = TILE_EMPTY;
@@ -834,14 +1099,40 @@ static void c_step(TileBlast* env) {
     int prev_threat = min_bomb_timer_affecting(env, a->r, a->c);
     int prev_r = a->r;
     int prev_c = a->c;
+    int prev_goal_dist = manhattan_distance(prev_r, prev_c, env->goal_r, env->goal_c);
+    int stuck_on_pheromones =
+        (env->no_progress_steps >= STUCK_NO_PROGRESS_STEPS) &&
+        (env->visit_heat[idx(env, prev_r, prev_c)] >= STUCK_HEAT_THRESHOLD);
     int goal_action = action_toward_goal(prev_r, prev_c, env->goal_r, env->goal_c);
     int goal_lane_blocked = enemy_blocks_action(env, prev_r, prev_c, goal_action, ENEMY_BLOCK_RANGE);
     int tactical_bomb_available = bomb_has_tactical_target(env, prev_r, prev_c, a->range);
+    int manhattan_enemy_blocker = should_bomb_manhattan_blocker(
+        env, prev_r, prev_c, env->goal_r, env->goal_c, a->range);
     int can_place_bomb = (bombs_owned(env, 0) < a->bombs_max && !bomb_at(env, prev_r, prev_c));
 
     int action = ACT_NOOP;
     if (env->actions) action = env->actions[0];
     if (action < ACT_NOOP || action > ACT_BOMB) action = ACT_NOOP;
+    int blocker_r = -1;
+    int blocker_c = -1;
+    int has_manhattan_blocker = find_manhattan_blocking_enemy(
+        env, prev_r, prev_c, env->goal_r, env->goal_c, &blocker_r, &blocker_c);
+    if (manhattan_enemy_blocker && can_place_bomb) {
+        action = ACT_BOMB;
+    } else if (has_manhattan_blocker) {
+        int destroy_action = choose_destroy_blocker_action(env, prev_r, prev_c, blocker_r, blocker_c);
+        if (destroy_action != ACT_NOOP) {
+            action = destroy_action;
+        }
+    }
+    if (action_is_unsafe(env, prev_r, prev_c, action)) {
+        int safe_action = stuck_on_pheromones
+            ? choose_detour_action(env, prev_r, prev_c)
+            : find_safe_goal_action(env, prev_r, prev_c);
+        if (safe_action != ACT_NOOP) {
+            action = safe_action;
+        }
+    }
     resolve_move(env, action);
     move_enemies(env);
     int planted_bomb = 0;
@@ -855,6 +1146,7 @@ static void c_step(TileBlast* env) {
 
     float reward = 0.0f;
     if (a->alive) {
+        reward -= STEP_PENALTY;
         int legal_moves = has_legal_move(env, prev_r, prev_c);
         int moved = (a->r != prev_r || a->c != prev_c);
         if (moved) {
@@ -862,6 +1154,11 @@ static void c_step(TileBlast* env) {
         } else {
             if (legal_moves) reward -= STALL_PENALTY;
         }
+        int new_goal_dist = manhattan_distance(a->r, a->c, env->goal_r, env->goal_c);
+        if (new_goal_dist < env->last_goal_dist) env->no_progress_steps = 0;
+        else env->no_progress_steps += 1;
+        env->last_goal_dist = new_goal_dist;
+        reward += (float)(prev_goal_dist - new_goal_dist) * GOAL_PROGRESS_REWARD;
         if (action == ACT_NOOP && legal_moves) {
             reward -= NOOP_PENALTY;
         }
@@ -963,6 +1260,9 @@ static void c_render(TileBlast* env) {
     if (IsKeyDown(KEY_ESCAPE)) {
         exit(0);
     }
+    if (IsKeyPressed(KEY_H)) {
+        g_show_visit_heat = !g_show_visit_heat;
+    }
 
     if (!g_static_ready || g_static_w != w || g_static_h != h) {
         if (g_static_ready) {
@@ -991,6 +1291,33 @@ static void c_render(TileBlast* env) {
 
     BeginDrawing();
     DrawTextureRec(g_static_tex.texture, (Rectangle){0, 0, (float)w, -(float)h}, (Vector2){0, 0}, WHITE);
+
+    float max_visit_heat = 0.0f;
+    if (g_show_visit_heat) {
+        for (int r = 0; r < env->height; r++) {
+            for (int c = 0; c < env->width; c++) {
+                int i = idx(env, r, c);
+                float heat = env->visit_heat[i];
+                if (heat <= 0.001f) continue;
+                if (heat > max_visit_heat) max_visit_heat = heat;
+
+                // Smoothly map unbounded heat to [0,1) without extra math deps.
+                float n = heat / (heat + 4.0f);
+                int alpha = (int)(n * 180.0f);
+                if (alpha < 10) alpha = 10;
+                if (alpha > 180) alpha = 180;
+
+                int red = (int)(40.0f + 210.0f * n);
+                int blue = (int)(240.0f - 180.0f * n);
+                if (red > 255) red = 255;
+                if (blue < 0) blue = 0;
+
+                int x = c * tile;
+                int y = r * tile;
+                DrawRectangle(x + 1, y + 1, tile - 2, tile - 2, (Color){(unsigned char)red, 80, (unsigned char)blue, (unsigned char)alpha});
+            }
+        }
+    }
 
     for (int r = 0; r < env->height; r++) {
         for (int c = 0; c < env->width; c++) {
@@ -1045,6 +1372,8 @@ static void c_render(TileBlast* env) {
 
     DrawText(TextFormat("Step: %d/%d", env->tick, env->max_steps), 10, 10, 18, (Color){255, 240, 200, 255});
     DrawText(TextFormat("Return: %.2f", env->episode_return_accum), 10, 32, 18, (Color){255, 240, 200, 255});
+    DrawText(TextFormat("Visit heat: %s (H)  max: %.2f", g_show_visit_heat ? "ON" : "OFF", max_visit_heat),
+             10, 54, 18, (Color){220, 230, 255, 255});
 
     EndDrawing();
 }

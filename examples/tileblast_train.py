@@ -21,12 +21,14 @@ def main():
     args["env"]["num_envs"] = 1
     args["env"]["vision"] = 0
     args["env"]["max_steps"] = 500
-    args["train"]["total_timesteps"] = 3000000
+    args["train"]["total_timesteps"] = 5000000
     args["train"]["device"] = "cuda"
-    # Exploration + stable PPO updates for sparse terminal rewards
+    # Keep enough exploration early, then let policy exploit hard objective.
     args["train"]["learning_rate"] = 3e-4
-    args["train"]["anneal_lr"] = False
-    args["train"]["ent_coef"] = 0.03
+    args["train"]["anneal_lr"] = True
+    args["train"]["ent_coef"] = 0.005
+    args["train"]["gamma"] = 0.995
+    args["train"]["gae_lambda"] = 0.95
     args["train"]["minibatch_size"] = 512
 
     pufferl.train(env_name, args=args)
