@@ -2,6 +2,7 @@
  * bash scripts/build_ocean.sh tileblast local
  */
 
+#define TILEBLAST_IMPLEMENTATION
 #include "tileblast.h"
 
 static int key_action() {

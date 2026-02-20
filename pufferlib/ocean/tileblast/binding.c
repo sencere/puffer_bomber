@@ -1,3 +1,4 @@
+#define TILEBLAST_IMPLEMENTATION
 #include "tileblast.h"
 
 #define Env TileBlast
