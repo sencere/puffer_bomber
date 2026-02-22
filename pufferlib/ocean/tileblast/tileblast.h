@@ -118,6 +118,7 @@ typedef struct {
     int* actions;                /* used (expects num_agents==1) */
     float* rewards;              /* optional; set to 0 */
     unsigned char* terminals;    /* optional; set to 0 (auto-resets) */
+    unsigned char* truncations;  /* optional; timeout signal */
 
     /* Legacy config fields (kept for callers) */
     int width;
@@ -125,8 +126,8 @@ typedef struct {
     int agent_speed; /* ignored; movement is 1 tile per step */
     int num_agents;  /* forced to 1 */
     int max_steps;
-    int vision;      /* ignored; obs removed */
-    int obs_size;    /* kept: width*height */
+    int vision;      /* 0: full map obs, >0: local square window */
+    int obs_size;    /* grid cells per observation */
     int scalar_size; /* kept: OBS_SCALARS */
 
     /* Runtime */
@@ -443,6 +444,12 @@ static void tb_generate_map(TileBlast* env) {
     }
 }
 
+static inline float tb_clip_reward(float reward) {
+    if (reward > 1.0f) return 1.0f;
+    if (reward < -1.0f) return -1.0f;
+    return reward;
+}
+
 /* --- Legacy observation write ------------------------------------------- */
 static void tb_update_observations(TileBlast* env) {
     if (!env->observations) return;
@@ -457,14 +464,28 @@ static void tb_update_observations(TileBlast* env) {
         Agent* agent = &env->agents[agent_index];
 
         int grid_write_index = 0;
-        for (int row = 0; row < env->height; row++) {
-            for (int col = 0; col < env->width; col++) {
-                unsigned char tile = env->grid[tb_idx(env, row, col)];
-                if (env->blast_timer[tb_idx(env, row, col)] > 0) tile = TILE_BLAST;
-                if (tb_enemy_at(env, row, col, -1)) tile = TILE_ENEMY;
-                if (row == env->goal_row && col == env->goal_col) tile = TILE_GOAL;
-                if (agent->alive && agent->row == row && agent->col == col) tile = TILE_AGENT0;
-                grid_obs[grid_write_index++] = tile;
+        int obs_row_start = 0;
+        int obs_row_end = env->height - 1;
+        int obs_col_start = 0;
+        int obs_col_end = env->width - 1;
+        if (env->vision > 0) {
+            obs_row_start = agent->row - env->vision;
+            obs_row_end = agent->row + env->vision;
+            obs_col_start = agent->col - env->vision;
+            obs_col_end = agent->col + env->vision;
+        }
+
+        for (int row = obs_row_start; row <= obs_row_end; row++) {
+            for (int col = obs_col_start; col <= obs_col_end; col++) {
+                unsigned char tile = TILE_HARD;
+                if (tb_in_bounds(env, row, col)) {
+                    tile = env->grid[tb_idx(env, row, col)];
+                    if (env->blast_timer[tb_idx(env, row, col)] > 0) tile = TILE_BLAST;
+                    if (tb_enemy_at(env, row, col, -1)) tile = TILE_ENEMY;
+                    if (row == env->goal_row && col == env->goal_col) tile = TILE_GOAL;
+                    if (agent->alive && agent->row == row && agent->col == col) tile = TILE_AGENT0;
+                }
+                if (grid_write_index < env->obs_size) grid_obs[grid_write_index++] = tile;
             }
         }
 
@@ -503,38 +524,7 @@ static void tb_update_observations(TileBlast* env) {
     }
 }
 
-/* --- API impl ----------------------------------------------------------- */
-void init(TileBlast* env) {
-    if (!env) return;
-
-    if (env->width <= 0) env->width = DEFAULT_WIDTH;
-    if (env->height <= 0) env->height = DEFAULT_HEIGHT;
-    if (env->max_steps <= 0) env->max_steps = DEFAULT_MAX_STEPS;
-
-    /* Keep legacy fields consistent */
-    env->num_agents = 1;
-    if (env->agent_speed <= 0) env->agent_speed = DEFAULT_AGENT_SPEED;
-    if (env->vision < 0) env->vision = DEFAULT_VISION;
-
-    env->obs_size = env->width * env->height; /* legacy expectation */
-    env->scalar_size = OBS_SCALARS;
-
-    int cells = env->width * env->height;
-    env->grid = (unsigned char*)calloc((size_t)cells, sizeof(unsigned char));
-    env->blast_timer = (unsigned char*)calloc((size_t)cells, sizeof(unsigned char));
-
-    env->max_bombs = env->num_agents * MAX_BOMBS_PER_AGENT + 4;
-    env->bombs = (Bomb*)calloc((size_t)env->max_bombs, sizeof(Bomb));
-
-    env->tick = 0;
-    env->goal_row = env->height - 2;
-    env->goal_col = env->width - 2;
-
-    /* Clear log (compat) */
-    memset(&env->log, 0, sizeof(env->log));
-}
-
-void c_reset(TileBlast* env) {
+static void tb_reset_episode(TileBlast* env, int clear_outputs) {
     if (!env) return;
 
     env->tick = 0;
@@ -576,10 +566,52 @@ void c_reset(TileBlast* env) {
         tb_init_enemy_patrol(env, i, enemy_row, enemy_col, horizontal, direction);
     }
 
-    /* Update observation buffer for policy input */
     tb_update_observations(env);
-    if (env->rewards) env->rewards[0] = 0.0f;
-    if (env->terminals) env->terminals[0] = 0;
+    if (clear_outputs) {
+        if (env->rewards) env->rewards[0] = 0.0f;
+        if (env->terminals) env->terminals[0] = 0;
+        if (env->truncations) env->truncations[0] = 0;
+    }
+}
+
+/* --- API impl ----------------------------------------------------------- */
+void init(TileBlast* env) {
+    if (!env) return;
+
+    if (env->width <= 0) env->width = DEFAULT_WIDTH;
+    if (env->height <= 0) env->height = DEFAULT_HEIGHT;
+    if (env->max_steps <= 0) env->max_steps = DEFAULT_MAX_STEPS;
+
+    /* Keep legacy fields consistent */
+    env->num_agents = 1;
+    if (env->agent_speed <= 0) env->agent_speed = DEFAULT_AGENT_SPEED;
+    if (env->vision < 0) env->vision = DEFAULT_VISION;
+
+    if (env->vision > 0) {
+        int obs_side = env->vision * 2 + 1;
+        env->obs_size = obs_side * obs_side;
+    } else {
+        env->obs_size = env->width * env->height;
+    }
+    env->scalar_size = OBS_SCALARS;
+
+    int cells = env->width * env->height;
+    env->grid = (unsigned char*)calloc((size_t)cells, sizeof(unsigned char));
+    env->blast_timer = (unsigned char*)calloc((size_t)cells, sizeof(unsigned char));
+
+    env->max_bombs = env->num_agents * MAX_BOMBS_PER_AGENT + 4;
+    env->bombs = (Bomb*)calloc((size_t)env->max_bombs, sizeof(Bomb));
+
+    env->tick = 0;
+    env->goal_row = env->height - 2;
+    env->goal_col = env->width - 2;
+
+    /* Clear log (compat) */
+    memset(&env->log, 0, sizeof(env->log));
+}
+
+void c_reset(TileBlast* env) {
+    tb_reset_episode(env, 1);
 }
 
 static void tb_resolve_move(TileBlast* env, int action) {
@@ -617,14 +649,15 @@ static int tb_agent_on_goal(const TileBlast* env) {
     return (agent->alive && agent->row == env->goal_row && agent->col == env->goal_col);
 }
 
-static void tb_finish_episode(TileBlast* env, Agent* agent) {
-    if (env->terminals) env->terminals[0] = 1; /* 1-frame pulse before reset */
+static void tb_finish_episode(TileBlast* env, Agent* agent, int timed_out) {
+    if (env->terminals) env->terminals[0] = (timed_out ? 0 : 1);
+    if (env->truncations) env->truncations[0] = (timed_out ? 1 : 0);
     env->log.episode_length = (float)env->tick;
     env->log.n += 1.0f;
     if (tb_agent_on_goal(env)) env->log.perf += 1.0f;
     if (env->tick >= env->max_steps) env->log.timeouts += 1.0f;
     if (!agent->alive) env->log.deaths += 1.0f;
-    c_reset(env);
+    tb_reset_episode(env, 0);
 }
 
 void c_step(TileBlast* env) {
@@ -634,6 +667,7 @@ void c_step(TileBlast* env) {
     float reward = 0.0f;
     if (env->rewards) env->rewards[0] = reward;
     if (env->terminals) env->terminals[0] = 0;
+    if (env->truncations) env->truncations[0] = 0;
 
     Agent* agent = &env->agents[0];
     int prev_goal_dist = tb_manhattan(agent->row, agent->col, env->goal_row, env->goal_col);
@@ -653,6 +687,7 @@ void c_step(TileBlast* env) {
     tb_update_bombs(env, &agent_hit);
 
     int done = 0;
+    int timed_out = 0;
     reward -= STEP_PENALTY;
     int new_goal_dist = tb_manhattan(agent->row, agent->col, env->goal_row, env->goal_col);
     reward += (float)(prev_goal_dist - new_goal_dist) * GOAL_PROGRESS_REWARD;
@@ -676,15 +711,17 @@ void c_step(TileBlast* env) {
         done = 1;
     } else if (env->tick >= env->max_steps) {
         reward -= TIMEOUT_PENALTY;
+        timed_out = 1;
         done = 1;
     }
 
+    reward = tb_clip_reward(reward);
     if (env->rewards) env->rewards[0] = reward;
     env->log.episode_return += reward;
 
     /* Minimal: auto-reset immediately */
     if (done) {
-        tb_finish_episode(env, agent);
+        tb_finish_episode(env, agent, timed_out);
         return;
     }
 

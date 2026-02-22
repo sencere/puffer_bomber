@@ -2,6 +2,7 @@
 #include "tileblast.h"
 
 #define Env TileBlast
+#define ENV_HAS_TRUNCATIONS
 #include "../env_binding.h"
 
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {

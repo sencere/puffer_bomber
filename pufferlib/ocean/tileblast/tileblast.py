@@ -67,6 +67,7 @@ class TileBlast(pufferlib.PufferEnv):
 
     def step(self, actions):
         self.tick += 1
+        actions = np.asarray(actions, dtype=np.int32).reshape(self.actions.shape)
         self.actions[:] = actions
         binding.vec_step(self.c_envs)
 

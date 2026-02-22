@@ -29,6 +29,7 @@ int main() {
     env.actions = (int*)calloc(env.num_agents, sizeof(int));
     env.rewards = (float*)calloc(env.num_agents, sizeof(float));
     env.terminals = (unsigned char*)calloc(env.num_agents, sizeof(unsigned char));
+    env.truncations = (unsigned char*)calloc(env.num_agents, sizeof(unsigned char));
 
     c_reset(&env);
     c_render(&env);
@@ -43,6 +44,7 @@ int main() {
     free(env.actions);
     free(env.rewards);
     free(env.terminals);
+    free(env.truncations);
     c_close(&env);
     return 0;
 }
