@@ -26,9 +26,10 @@
 #define DEFAULT_AGENT_SPEED 1
 #define DEFAULT_MAX_STEPS 500
 #define DEFAULT_VISION 0
+#define DEFAULT_DISTANCE_REWARD_INTERVAL 5
 
 /* Keep these for API compatibility. */
-#define OBS_SCALARS 8
+#define OBS_SCALARS 13
 typedef enum ObsChannel {
     OBS_GRID = 0,
     OBS_CHANNELS = 1,
@@ -41,14 +42,28 @@ typedef enum ObsChannel {
 #define BLAST_TIME 2
 #define ENEMY_COUNT 3
 #define ENEMY_MOVE_INTERVAL 8
-#define STEP_PENALTY 0.01f
-#define GOAL_PROGRESS_REWARD 0.10f
-#define GOAL_REWARD 5.0f
-#define ENEMY_COLLISION_PENALTY 2.0f
-#define BLAST_DEATH_PENALTY 2.0f
-#define TIMEOUT_PENALTY 1.0f
+#define STEP_PENALTY 0.005f
+#define GOAL_PROGRESS_REWARD 0.12f
+#define INTERVAL_REVERSE_FACTOR 1.25f
+#define INTERVAL_NO_PROGRESS_PENALTY 0.04f
+#define SOFT_BREAK_REWARD 0.06f
+#define ENEMY_KILL_REWARD 0.25f
+#define SMART_BOMB_REWARD 0.00f
+#define WASTED_BOMB_PENALTY 0.05f
+#define FAILED_BOMB_PENALTY 0.03f
+#define DANGER_PENALTY 0.01f
+#define ESCAPE_DANGER_REWARD 0.04f
+#define GOAL_REWARD 1.00f
+#define ENEMY_COLLISION_PENALTY 0.90f
+#define BLAST_DEATH_PENALTY 0.90f
+#define TIMEOUT_PENALTY 0.60f
 #define TB_SAMPLE_ATTEMPTS 256
 #define TB_U8_MAX 255
+#define TB_OUTCOME_NONE 0
+#define TB_OUTCOME_WIN 1
+#define TB_OUTCOME_DEAD 2
+#define TB_OUTCOME_TIMEOUT 3
+#define TB_OUTCOME_BANNER_TICKS 24
 
 /* --- Actions ------------------------------------------------------------ */
 typedef enum ActionID {
@@ -75,6 +90,7 @@ typedef enum TileID {
 /* --- Log (kept for compatibility; not used) ---------------------------- */
 typedef struct {
     float perf;
+    float wins;
     float score;
     float episode_return;
     float episode_length;
@@ -127,12 +143,17 @@ typedef struct {
     int num_agents;  /* forced to 1 */
     int max_steps;
     int vision;      /* 0: full map obs, >0: local square window */
+    int distance_reward_interval; /* apply path progress reward every n steps */
     int obs_size;    /* grid cells per observation */
     int scalar_size; /* kept: OBS_SCALARS */
 
     /* Runtime */
     int tick;
     int goal_row, goal_col;
+    float ep_return;
+    int last_progress_dist;
+    int last_outcome;
+    int outcome_banner_ticks;
 
     unsigned char* grid;        /* TILE_* */
     unsigned char* blast_timer; /* overlay for rendering + damage */
@@ -190,6 +211,119 @@ static int tb_goal_action_hint(TileBlast* env, int row, int col) {
     return goal_col_offset > 0 ? ACT_RIGHT : ACT_LEFT;
 }
 
+static int tb_is_solid(TileBlast* env, int row, int col);
+
+static int tb_shortest_path_to_goal(TileBlast* env, int start_row, int start_col) {
+    if (!tb_in_bounds(env, start_row, start_col)) return -1;
+    if (start_row == env->goal_row && start_col == env->goal_col) return 0;
+    if (tb_is_solid(env, start_row, start_col)) return -1;
+
+    int cells = env->width * env->height;
+    int* dist = (int*)malloc((size_t)cells * sizeof(int));
+    int* queue = (int*)malloc((size_t)cells * sizeof(int));
+    if (!dist || !queue) {
+        free(dist);
+        free(queue);
+        return -1;
+    }
+
+    for (int i = 0; i < cells; i++) dist[i] = -1;
+    int head = 0;
+    int tail = 0;
+    int start_index = tb_idx(env, start_row, start_col);
+    dist[start_index] = 0;
+    queue[tail++] = start_index;
+
+    static const int direction_steps[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
+    while (head < tail) {
+        int current = queue[head++];
+        int row = current / env->width;
+        int col = current % env->width;
+        int current_dist = dist[current];
+
+        for (int i = 0; i < 4; i++) {
+            int next_row = row + direction_steps[i][0];
+            int next_col = col + direction_steps[i][1];
+            if (!tb_in_bounds(env, next_row, next_col)) continue;
+            if (tb_is_solid(env, next_row, next_col)) continue;
+            int next_index = tb_idx(env, next_row, next_col);
+            if (dist[next_index] != -1) continue;
+            dist[next_index] = current_dist + 1;
+            if (next_row == env->goal_row && next_col == env->goal_col) {
+                int goal_dist = dist[next_index];
+                free(dist);
+                free(queue);
+                return goal_dist;
+            }
+            queue[tail++] = next_index;
+        }
+    }
+
+    free(dist);
+    free(queue);
+    return -1;
+}
+
+static int tb_goal_action_hint_path(TileBlast* env, int row, int col) {
+    if (row == env->goal_row && col == env->goal_col) return ACT_NOOP;
+
+    int best_action = ACT_NOOP;
+    int best_distance = 1 << 30;
+    static const int direction_steps[4][2] = {{-1,0},{1,0},{0,-1},{0,1}};
+    static const int direction_actions[4] = {ACT_UP, ACT_DOWN, ACT_LEFT, ACT_RIGHT};
+
+    for (int i = 0; i < 4; i++) {
+        int next_row = row + direction_steps[i][0];
+        int next_col = col + direction_steps[i][1];
+        if (tb_is_solid(env, next_row, next_col)) continue;
+        int d = tb_shortest_path_to_goal(env, next_row, next_col);
+        if (d < 0) continue;
+        if (d < best_distance) {
+            best_distance = d;
+            best_action = direction_actions[i];
+        }
+    }
+
+    if (best_action != ACT_NOOP) return best_action;
+    return tb_goal_action_hint(env, row, col);
+}
+
+static void tb_goal_step_vector(TileBlast* env, int row, int col, int* row_step, int* col_step) {
+    *row_step = 0;
+    *col_step = 0;
+    int action = tb_goal_action_hint_path(env, row, col);
+    switch (action) {
+        case ACT_UP: *row_step = -1; break;
+        case ACT_DOWN: *row_step = 1; break;
+        case ACT_LEFT: *col_step = -1; break;
+        case ACT_RIGHT: *col_step = 1; break;
+        default: break;
+    }
+}
+
+static unsigned char tb_encode_signed_unit(int value) {
+    if (value < -1) value = -1;
+    if (value > 1) value = 1;
+    return (unsigned char)(value + 1); /* -1,0,1 -> 0,1,2 */
+}
+
+static int tb_count_alive_enemies(TileBlast* env) {
+    int alive_enemies = 0;
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        if (env->enemies[i].alive) alive_enemies++;
+    }
+    return alive_enemies;
+}
+
+static int tb_count_soft_tiles(TileBlast* env) {
+    int soft_tiles = 0;
+    int cells = env->width * env->height;
+    for (int i = 0; i < cells; i++) {
+        if (env->grid[i] == TILE_SOFT) soft_tiles++;
+    }
+    return soft_tiles;
+}
+
 static int tb_is_solid(TileBlast* env, int row, int col) {
     if (!tb_in_bounds(env, row, col)) return 1;
     if (row == env->goal_row && col == env->goal_col) return 0;
@@ -199,6 +333,88 @@ static int tb_is_solid(TileBlast* env, int row, int col) {
 
 static int tb_is_blocking_tile(unsigned char tile) {
     return (tile == TILE_HARD || tile == TILE_SOFT || tile == TILE_BOMB);
+}
+
+static void tb_count_bomb_targets(TileBlast* env, int row, int col, int range,
+    int* soft_targets, int* enemy_targets) {
+    if (soft_targets) *soft_targets = 0;
+    if (enemy_targets) *enemy_targets = 0;
+    static const int direction_steps[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
+
+    for (int direction_index = 0; direction_index < 4; direction_index++) {
+        int row_step = direction_steps[direction_index][0];
+        int col_step = direction_steps[direction_index][1];
+        for (int step = 1; step <= range; step++) {
+            int scan_row = row + row_step * step;
+            int scan_col = col + col_step * step;
+            if (!tb_in_bounds(env, scan_row, scan_col)) break;
+
+            unsigned char tile = env->grid[tb_idx(env, scan_row, scan_col)];
+            if (tile == TILE_HARD) break;
+
+            if (enemy_targets && tb_enemy_at(env, scan_row, scan_col, -1)) {
+                (*enemy_targets)++;
+            }
+
+            if (tile == TILE_SOFT) {
+                if (soft_targets) (*soft_targets)++;
+                break;
+            }
+        }
+    }
+}
+
+static int tb_cell_in_blast_path(TileBlast* env, int row, int col) {
+    for (int i = 0; i < env->max_bombs; i++) {
+        Bomb* bomb = &env->bombs[i];
+        if (!bomb->active) continue;
+        if (bomb->row == row && bomb->col == col) return 1;
+
+        if (bomb->row == row) {
+            int delta = col - bomb->col;
+            int abs_delta = delta < 0 ? -delta : delta;
+            if (abs_delta > bomb->range) continue;
+            int col_step = (delta > 0) ? 1 : -1;
+            int blocked = 0;
+            for (int c = bomb->col + col_step; c != col; c += col_step) {
+                unsigned char tile = env->grid[tb_idx(env, row, c)];
+                if (tile == TILE_HARD) { blocked = 1; break; }
+                if (tile == TILE_SOFT) { blocked = 1; break; }
+            }
+            if (!blocked) {
+                unsigned char tile = env->grid[tb_idx(env, row, col)];
+                if (tile != TILE_HARD) return 1;
+            }
+        } else if (bomb->col == col) {
+            int delta = row - bomb->row;
+            int abs_delta = delta < 0 ? -delta : delta;
+            if (abs_delta > bomb->range) continue;
+            int row_step = (delta > 0) ? 1 : -1;
+            int blocked = 0;
+            for (int r = bomb->row + row_step; r != row; r += row_step) {
+                unsigned char tile = env->grid[tb_idx(env, r, col)];
+                if (tile == TILE_HARD) { blocked = 1; break; }
+                if (tile == TILE_SOFT) { blocked = 1; break; }
+            }
+            if (!blocked) {
+                unsigned char tile = env->grid[tb_idx(env, row, col)];
+                if (tile != TILE_HARD) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int tb_count_safe_moves(TileBlast* env, int row, int col) {
+    static const int direction_steps[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
+    int safe_moves = 0;
+    for (int i = 0; i < 4; i++) {
+        int next_row = row + direction_steps[i][0];
+        int next_col = col + direction_steps[i][1];
+        if (tb_is_solid(env, next_row, next_col)) continue;
+        if (!tb_cell_in_blast_path(env, next_row, next_col)) safe_moves++;
+    }
+    return safe_moves;
 }
 
 /* --- Bombs / blasts ----------------------------------------------------- */
@@ -489,16 +705,18 @@ static void tb_update_observations(TileBlast* env) {
             }
         }
 
-        int dist_goal = tb_manhattan(agent->row, agent->col, env->goal_row, env->goal_col);
-        int dist_enemy = TB_U8_MAX;
+        int max_dist = env->width + env->height;
+        int dist_goal = tb_shortest_path_to_goal(env, agent->row, agent->col);
+        if (dist_goal < 0) dist_goal = max_dist;
+        int dist_enemy = max_dist;
         for (int i = 0; i < ENEMY_COUNT; i++) {
             Enemy* enemy = &env->enemies[i];
             if (!enemy->alive) continue;
             int enemy_distance = tb_manhattan(agent->row, agent->col, enemy->row, enemy->col);
             if (enemy_distance < dist_enemy) dist_enemy = enemy_distance;
         }
-        int dist_bomb = TB_U8_MAX;
-        int min_bomb_timer = TB_U8_MAX;
+        int dist_bomb = max_dist;
+        int min_bomb_timer = BOMB_TIMER + 1;
         for (int i = 0; i < env->max_bombs; i++) {
             Bomb* bomb = &env->bombs[i];
             if (!bomb->active) continue;
@@ -511,7 +729,15 @@ static void tb_update_observations(TileBlast* env) {
         if (available_bombs < 0) available_bombs = 0;
         int can_place_bomb = (agent->alive && owned_bombs < agent->bombs_max &&
             !tb_bomb_at(env, agent->row, agent->col)) ? 1 : 0;
-        int goal_hint = tb_goal_action_hint(env, agent->row, agent->col);
+        int goal_row_step = 0;
+        int goal_col_step = 0;
+        tb_goal_step_vector(env, agent->row, agent->col, &goal_row_step, &goal_col_step);
+        int danger_now = tb_cell_in_blast_path(env, agent->row, agent->col);
+        int safe_moves = tb_count_safe_moves(env, agent->row, agent->col);
+        int bomb_soft_targets = 0;
+        int bomb_enemy_targets = 0;
+        tb_count_bomb_targets(env, agent->row, agent->col, agent->range,
+            &bomb_soft_targets, &bomb_enemy_targets);
 
         if (env->scalar_size >= 1) scalar_obs[0] = tb_clamp_u8(dist_goal);
         if (env->scalar_size >= 2) scalar_obs[1] = tb_clamp_u8(dist_enemy);
@@ -520,7 +746,12 @@ static void tb_update_observations(TileBlast* env) {
         if (env->scalar_size >= 5) scalar_obs[4] = tb_clamp_u8(available_bombs);
         if (env->scalar_size >= 6) scalar_obs[5] = tb_clamp_u8(can_place_bomb);
         if (env->scalar_size >= 7) scalar_obs[6] = (unsigned char)(agent->alive ? 1 : 0);
-        if (env->scalar_size >= 8) scalar_obs[7] = tb_clamp_u8(goal_hint);
+        if (env->scalar_size >= 8) scalar_obs[7] = tb_encode_signed_unit(goal_row_step);
+        if (env->scalar_size >= 9) scalar_obs[8] = tb_clamp_u8(danger_now);
+        if (env->scalar_size >= 10) scalar_obs[9] = tb_clamp_u8(safe_moves);
+        if (env->scalar_size >= 11) scalar_obs[10] = tb_clamp_u8(bomb_soft_targets);
+        if (env->scalar_size >= 12) scalar_obs[11] = tb_clamp_u8(bomb_enemy_targets);
+        if (env->scalar_size >= 13) scalar_obs[12] = tb_encode_signed_unit(goal_col_step);
     }
 }
 
@@ -528,6 +759,7 @@ static void tb_reset_episode(TileBlast* env, int clear_outputs) {
     if (!env) return;
 
     env->tick = 0;
+    env->ep_return = 0.0f;
     memset(env->blast_timer, 0, (size_t)env->width * (size_t)env->height);
 
     tb_sample_goal(env);
@@ -566,6 +798,13 @@ static void tb_reset_episode(TileBlast* env, int clear_outputs) {
         tb_init_enemy_patrol(env, i, enemy_row, enemy_col, horizontal, direction);
     }
 
+    env->last_progress_dist = tb_shortest_path_to_goal(
+        env, env->agents[0].row, env->agents[0].col
+    );
+    if (env->last_progress_dist < 0) {
+        env->last_progress_dist = env->width + env->height;
+    }
+
     tb_update_observations(env);
     if (clear_outputs) {
         if (env->rewards) env->rewards[0] = 0.0f;
@@ -581,6 +820,9 @@ void init(TileBlast* env) {
     if (env->width <= 0) env->width = DEFAULT_WIDTH;
     if (env->height <= 0) env->height = DEFAULT_HEIGHT;
     if (env->max_steps <= 0) env->max_steps = DEFAULT_MAX_STEPS;
+    if (env->distance_reward_interval <= 0) {
+        env->distance_reward_interval = DEFAULT_DISTANCE_REWARD_INTERVAL;
+    }
 
     /* Keep legacy fields consistent */
     env->num_agents = 1;
@@ -605,6 +847,10 @@ void init(TileBlast* env) {
     env->tick = 0;
     env->goal_row = env->height - 2;
     env->goal_col = env->width - 2;
+    env->ep_return = 0.0f;
+    env->last_progress_dist = env->width + env->height;
+    env->last_outcome = TB_OUTCOME_NONE;
+    env->outcome_banner_ticks = 0;
 
     /* Clear log (compat) */
     memset(&env->log, 0, sizeof(env->log));
@@ -650,18 +896,42 @@ static int tb_agent_on_goal(const TileBlast* env) {
 }
 
 static void tb_finish_episode(TileBlast* env, Agent* agent, int timed_out) {
+    int reached_goal = tb_agent_on_goal(env);
     if (env->terminals) env->terminals[0] = (timed_out ? 0 : 1);
     if (env->truncations) env->truncations[0] = (timed_out ? 1 : 0);
-    env->log.episode_length = (float)env->tick;
+    env->log.score += env->ep_return;
+    env->log.episode_return += env->ep_return;
+    env->log.episode_length += (float)env->tick;
     env->log.n += 1.0f;
-    if (tb_agent_on_goal(env)) env->log.perf += 1.0f;
+    if (reached_goal) {
+        env->log.perf += 1.0f;
+        env->log.wins += 1.0f;
+    }
     if (env->tick >= env->max_steps) env->log.timeouts += 1.0f;
     if (!agent->alive) env->log.deaths += 1.0f;
+    if (reached_goal) {
+        env->last_outcome = TB_OUTCOME_WIN;
+        env->outcome_banner_ticks = TB_OUTCOME_BANNER_TICKS;
+    } else if (timed_out) {
+        env->last_outcome = TB_OUTCOME_TIMEOUT;
+        env->outcome_banner_ticks = TB_OUTCOME_BANNER_TICKS;
+    } else if (!agent->alive) {
+        env->last_outcome = TB_OUTCOME_DEAD;
+        env->outcome_banner_ticks = TB_OUTCOME_BANNER_TICKS;
+    } else {
+        env->last_outcome = TB_OUTCOME_NONE;
+        env->outcome_banner_ticks = 0;
+    }
     tb_reset_episode(env, 0);
 }
 
 void c_step(TileBlast* env) {
     if (!env) return;
+
+    if (env->outcome_banner_ticks > 0) {
+        env->outcome_banner_ticks -= 1;
+        if (env->outcome_banner_ticks == 0) env->last_outcome = TB_OUTCOME_NONE;
+    }
 
     /* legacy outputs: always write safe defaults */
     float reward = 0.0f;
@@ -670,15 +940,26 @@ void c_step(TileBlast* env) {
     if (env->truncations) env->truncations[0] = 0;
 
     Agent* agent = &env->agents[0];
-    int prev_goal_dist = tb_manhattan(agent->row, agent->col, env->goal_row, env->goal_col);
+    int prev_goal_dist = env->last_progress_dist;
+    if (prev_goal_dist < 0) prev_goal_dist = env->width + env->height;
+    int prev_alive_enemies = tb_count_alive_enemies(env);
+    int prev_soft_tiles = tb_count_soft_tiles(env);
+    int was_in_danger = tb_cell_in_blast_path(env, agent->row, agent->col);
 
     env->tick += 1;
     tb_decay_blasts(env);
 
     int action = tb_read_action(env);
+    int bomb_soft_targets = 0;
+    int bomb_enemy_targets = 0;
+    if (action == ACT_BOMB) {
+        tb_count_bomb_targets(env, agent->row, agent->col, agent->range,
+            &bomb_soft_targets, &bomb_enemy_targets);
+    }
 
     if (action >= ACT_UP && action <= ACT_RIGHT) tb_resolve_move(env, action);
-    if (action == ACT_BOMB) tb_place_bomb(env);
+    int placed_bomb = 0;
+    if (action == ACT_BOMB) placed_bomb = tb_place_bomb(env);
     int touched_enemy_after_player_move = tb_enemy_at(env, agent->row, agent->col, -1);
 
     tb_move_enemies(env);
@@ -688,9 +969,28 @@ void c_step(TileBlast* env) {
 
     int done = 0;
     int timed_out = 0;
+    int reached_goal = 0;
     reward -= STEP_PENALTY;
-    int new_goal_dist = tb_manhattan(agent->row, agent->col, env->goal_row, env->goal_col);
-    reward += (float)(prev_goal_dist - new_goal_dist) * GOAL_PROGRESS_REWARD;
+    int new_goal_dist = tb_shortest_path_to_goal(env, agent->row, agent->col);
+    if (new_goal_dist < 0) new_goal_dist = env->width + env->height;
+    int alive_enemies = tb_count_alive_enemies(env);
+    int soft_tiles = tb_count_soft_tiles(env);
+    int killed_enemies = prev_alive_enemies - alive_enemies;
+    int broken_soft_tiles = prev_soft_tiles - soft_tiles;
+    if (killed_enemies > 0) reward += (float)killed_enemies * ENEMY_KILL_REWARD;
+    if (broken_soft_tiles > 0) reward += (float)broken_soft_tiles * SOFT_BREAK_REWARD;
+    if (placed_bomb) {
+        if ((bomb_soft_targets + bomb_enemy_targets) > 0) {
+            reward += SMART_BOMB_REWARD;
+        } else {
+            reward -= WASTED_BOMB_PENALTY;
+        }
+    } else if (action == ACT_BOMB) {
+        reward -= FAILED_BOMB_PENALTY;
+    }
+    int in_danger_now = tb_cell_in_blast_path(env, agent->row, agent->col);
+    if (in_danger_now) reward -= DANGER_PENALTY;
+    if (was_in_danger && !in_danger_now) reward += ESCAPE_DANGER_REWARD;
 
     if (!agent->alive) {
         done = 1;
@@ -707,6 +1007,7 @@ void c_step(TileBlast* env) {
         reward -= BLAST_DEATH_PENALTY;
         done = 1;
     } else if (tb_agent_on_goal(env)) {
+        reached_goal = 1;
         reward += GOAL_REWARD;
         done = 1;
     } else if (env->tick >= env->max_steps) {
@@ -715,9 +1016,24 @@ void c_step(TileBlast* env) {
         done = 1;
     }
 
+    int progress_tick = (env->tick % env->distance_reward_interval) == 0;
+    if (progress_tick || done) {
+        int progress_delta = prev_goal_dist - new_goal_dist;
+        if (reached_goal) {
+            if (progress_delta > 0) reward += (float)progress_delta * GOAL_PROGRESS_REWARD;
+        } else if (progress_delta > 0) {
+            reward += (float)progress_delta * GOAL_PROGRESS_REWARD;
+        } else if (progress_delta < 0) {
+            reward -= (float)(-progress_delta) * GOAL_PROGRESS_REWARD * INTERVAL_REVERSE_FACTOR;
+        } else {
+            reward -= INTERVAL_NO_PROGRESS_PENALTY;
+        }
+        env->last_progress_dist = new_goal_dist;
+    }
+
     reward = tb_clip_reward(reward);
     if (env->rewards) env->rewards[0] = reward;
-    env->log.episode_return += reward;
+    env->ep_return += reward;
 
     /* Minimal: auto-reset immediately */
     if (done) {

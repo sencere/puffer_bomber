@@ -6,7 +6,7 @@ import numpy as np
 import pufferlib
 from pufferlib.ocean.tileblast import binding
 
-SCALAR_OBS = 8
+SCALAR_OBS = 13
 
 class TileBlast(pufferlib.PufferEnv):
     def __init__(
@@ -22,6 +22,7 @@ class TileBlast(pufferlib.PufferEnv):
         agent_speed=1,
         max_steps=200000,
         vision=0,
+        distance_reward_interval=5,
     ):
         assert num_agents == 1, "TileBlast goal mode is single-agent (num_agents must be 1)"
         if vision == 0:
@@ -55,6 +56,7 @@ class TileBlast(pufferlib.PufferEnv):
                 agent_speed=agent_speed,
                 max_steps=max_steps,
                 vision=vision,
+                distance_reward_interval=distance_reward_interval,
             )
             c_envs.append(c_env)
 

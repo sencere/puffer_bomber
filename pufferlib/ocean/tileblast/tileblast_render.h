@@ -121,6 +121,30 @@ static void tb_render_impl(TileBlast* env) {
     DrawText(TextFormat("Step %d/%d", env->tick, env->max_steps), 10, wh + 12, 18, (Color){228, 232, 244, 255});
     DrawText("Arrows/WASD move, SPACE bomb, ESC quit", 170, wh + 12, 18, (Color){170, 182, 212, 255});
 
+    if (env->outcome_banner_ticks > 0) {
+        const char* label = NULL;
+        Color color = WHITE;
+        if (env->last_outcome == TB_OUTCOME_WIN) {
+            label = "WIN";
+            color = (Color){90, 235, 140, 255};
+        } else if (env->last_outcome == TB_OUTCOME_TIMEOUT) {
+            label = "TIMEOUT";
+            color = (Color){255, 210, 120, 255};
+        } else if (env->last_outcome == TB_OUTCOME_DEAD) {
+            label = "DEAD";
+            color = (Color){255, 120, 130, 255};
+        }
+
+        if (label) {
+            int font_size = 34;
+            int tw = MeasureText(label, font_size);
+            int tx = (ww - tw) / 2;
+            int ty = 8;
+            DrawRectangle(tx - 14, ty - 8, tw + 28, font_size + 16, (Color){12, 14, 22, 180});
+            DrawRectangleLines(tx - 14, ty - 8, tw + 28, font_size + 16, (Color){220, 228, 245, 110});
+            DrawText(label, tx, ty, font_size, color);
+        }
+    }
+
     EndDrawing();
 }
-

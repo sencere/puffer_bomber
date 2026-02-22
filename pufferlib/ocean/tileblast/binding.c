@@ -12,18 +12,23 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     env->agent_speed = (int)unpack(kwargs, "agent_speed");
     env->max_steps = (int)unpack(kwargs, "max_steps");
     env->vision = (int)unpack(kwargs, "vision");
+    env->distance_reward_interval = (int)unpack(kwargs, "distance_reward_interval");
     if (env->num_agents <= 0) env->num_agents = 1;
     if (env->num_agents > 1) env->num_agents = 1;
     if (env->width <= 0) env->width = 15;
     if (env->height <= 0) env->height = 13;
     if (env->agent_speed <= 0) env->agent_speed = DEFAULT_AGENT_SPEED;
     if (env->max_steps <= 0) env->max_steps = DEFAULT_MAX_STEPS;
+    if (env->distance_reward_interval <= 0) {
+        env->distance_reward_interval = DEFAULT_DISTANCE_REWARD_INTERVAL;
+    }
     init(env);
     return 0;
 }
 
 static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "perf", log->perf);
+    assign_to_dict(dict, "wins", log->wins);
     assign_to_dict(dict, "score", log->score);
     assign_to_dict(dict, "episode_return", log->episode_return);
     assign_to_dict(dict, "episode_length", log->episode_length);
